@@ -614,6 +614,232 @@ class TrueSkill(object):
                 'draw_probability=%s%s)' % args)
 
 
+class CoachTrueSkill(TrueSkill):
+    def validate_rating_groups(self, rating_groups):
+        # Check group sizes
+        if len(rating_groups) < 2:
+            raise ValueError("Need multiple rating groups")
+        elif any([len(rating_group) != 2 for rating_group in rating_groups]):
+            raise ValueError("Each group must contain one coach and it's respective team")
+        elif any([len(rating_group[0]) != 1 for rating_group in rating_groups]):
+            raise ValueError("Each group must contain a coach")
+        elif not all([rating_group[1] for rating_group in rating_groups]):
+            raise ValueError("Each group must contain multiple ratings")
+        # Check group types
+        coach_group_types = set(map(type, [rating_group[0] for rating_group in rating_groups]))
+        if len(coach_group_types) != 1:
+            raise TypeError("All coaches should have the same type")
+        elif coach_group_types.pop() is Rating:
+            raise TypeError("Rating cannot be a rating type")
+        player_group_types = set(map(type, [rating_group[1] for rating_group in rating_groups]))
+        if len(player_group_types) != 1:
+            raise TypeError("All players should have the same type")
+        elif player_group_types.pop() is Rating:
+            raise TypeError("Rating cannot be a rating type")
+
+        coach_keys = []
+        coach_rating_groups = []
+        player_keys = []
+        player_rating_groups = []
+        for coach_rating_group, players_rating_group in rating_groups:
+            coach_key, coach_rating = [(k, v) for k, v in coach_rating_group.items()][0]
+            coach_keys.append(coach_key)
+            coach_rating_groups.append(coach_rating)
+
+            team_player_keys, team_player_ratings = [], []
+            for player_key, player_rating in players_rating_group.items():
+                team_player_keys.append(player_key)
+                team_player_ratings.append(player_rating)
+            player_keys.append(tuple(team_player_keys))
+            player_rating_groups.append(tuple(team_player_ratings))
+
+        return coach_rating_groups, coach_keys, player_rating_groups, player_keys
+
+    def factor_graph_builders(self, coach_rating_groups, player_rating_groups, ranks, weights):
+        flatten_coach_ratings = tuple([obj for obj in coach_rating_groups])
+        flatten_player_ratings = sum(map(tuple, player_rating_groups), ())
+        flatten_weights = sum(map(tuple, weights), ())
+        n_coaches = len(flatten_coach_ratings)
+        n_players = len(flatten_player_ratings)
+        n_teams = len(player_rating_groups)
+        # create variables
+        coach_rating_vars = [Variable() for x in range(n_coaches)]
+        players_rating_vars = [Variable() for x in range(n_players)]
+        perf_vars = [Variable() for x in range(n_players)]
+        team_perf_vars = [Variable() for x in range(n_teams)]
+        team_diff_vars = [Variable() for x in range(n_teams - 1)]
+        team_sizes = _team_sizes(player_rating_groups)
+
+        coach_by_player = []
+        for i in range(len(player_rating_groups)):
+            rating_group = player_rating_groups[i]
+            for player_rating in rating_group:
+                coach_by_player.append((player_rating, coach_rating_vars[i]))
+
+        # layer builders
+        def build_coach_rating_layer():
+            for coach_rating_var, rating in zip(coach_rating_vars, flatten_coach_ratings):
+                yield PriorFactor(coach_rating_var, rating, self.tau)
+        def build_player_prior_rating_layer():
+            for player_rating_var, rating in zip(players_rating_vars, flatten_player_ratings):
+                yield PriorFactor(player_rating_var, rating, self.tau)
+        def build_coach_likelihood_rating_layer():
+            for coach, coach_rating_var in enumerate(coach_rating_vars):
+                if coach > 0:
+                    start = team_sizes[coach - 1]
+                else:
+                    start = 0
+                end = team_sizes[coach]
+                child_rating_vars = players_rating_vars[start:end]
+                for child_rating_var in child_rating_vars:
+                    yield LikelihoodFactor(coach_rating_var, child_rating_var, self.beta ** 2)
+        def build_perf_layer():
+            for player_rating_var, perf_var in zip(players_rating_vars, perf_vars):
+                yield LikelihoodFactor(player_rating_var, perf_var, self.beta ** 2)
+        def build_team_perf_layer():
+            for team, team_perf_var in enumerate(team_perf_vars):
+                if team > 0:
+                    start = team_sizes[team - 1]
+                else:
+                    start = 0
+                end = team_sizes[team]
+                child_perf_vars = perf_vars[start:end]
+                coeffs = flatten_weights[start:end]
+                yield SumFactor(team_perf_var, child_perf_vars, coeffs)
+        def build_team_diff_layer():
+            for team, team_diff_var in enumerate(team_diff_vars):
+                yield SumFactor(team_diff_var,
+                                team_perf_vars[team:team + 2], [+1, -1])
+        def build_trunc_layer():
+            for x, team_diff_var in enumerate(team_diff_vars):
+                if callable(self.draw_probability):
+                    # dynamic draw probability
+                    team_perf1, team_perf2 = team_perf_vars[x:x + 2]
+                    args = (Rating(team_perf1), Rating(team_perf2), self)
+                    draw_probability = self.draw_probability(*args)
+                else:
+                    # static draw probability
+                    draw_probability = self.draw_probability
+                size = sum(map(len, player_rating_groups[x:x + 2]))
+                draw_margin = calc_draw_margin(draw_probability, size, self)
+                if ranks[x] == ranks[x + 1]:  # is a tie?
+                    v_func, w_func = self.v_draw, self.w_draw
+                else:
+                    v_func, w_func = self.v_win, self.w_win
+                yield TruncateFactor(team_diff_var,
+                                     v_func, w_func, draw_margin)
+        # build layers
+        return (build_coach_rating_layer,
+                build_player_prior_rating_layer,
+                build_coach_likelihood_rating_layer,
+                build_perf_layer,
+                build_team_perf_layer,
+                build_team_diff_layer,
+                build_trunc_layer)
+
+    def run_schedule(self, build_coach_rating_layer, build_player_prior_rating_layer,
+                     build_coach_likelihood_rating_layer, build_perf_layer, build_team_perf_layer,
+                     build_team_diff_layer, build_trunc_layer, min_delta=DELTA):
+        if min_delta <= 0:
+            raise ValueError('min_delta must be greater than 0')
+        layers = []
+        def build(builders):
+            layers_built = [list(build()) for build in builders]
+            layers.extend(layers_built)
+            return layers_built
+        layers_built = build([build_coach_rating_layer,
+                              build_player_prior_rating_layer,
+                              build_coach_likelihood_rating_layer,
+                              build_perf_layer,
+                              build_team_perf_layer])
+        (coach_rating_layer,
+         player_prior_rating_layer,
+         coach_likelihood_rating_layer,
+         perf_layer,
+         team_perf_layer) = layers_built
+        for f in chain(*layers_built):
+            f.down()
+        # arrow #1, #2, #3
+        team_diff_layer, trunc_layer = build([build_team_diff_layer,
+                                              build_trunc_layer])
+        team_diff_len = len(team_diff_layer)
+        for x in range(10):
+            if team_diff_len == 1:
+                # only two teams
+                team_diff_layer[0].down()
+                delta = trunc_layer[0].up()
+            else:
+                # multiple teams
+                delta = 0
+                for x in range(team_diff_len - 1):
+                    team_diff_layer[x].down()
+                    delta = max(delta, trunc_layer[x].up())
+                    team_diff_layer[x].up(1)  # up to right variable
+                for x in range(team_diff_len - 1, 0, -1):
+                    team_diff_layer[x].down()
+                    delta = max(delta, trunc_layer[x].up())
+                    team_diff_layer[x].up(0)  # up to left variable
+            # repeat until to small update
+            if delta <= min_delta:
+                break
+        # up both ends
+        team_diff_layer[0].up(0)
+        team_diff_layer[team_diff_len - 1].up(1)
+        # up the remainder of the black arrows
+        for f in team_perf_layer:
+            for x in range(len(f.vars) - 1):
+                f.up(x)
+        for f in perf_layer:
+            f.up()
+        for f in coach_likelihood_rating_layer:
+            f.up()
+        return layers
+
+    def rate(self, rating_groups, ranks=None, weights=None, min_delta=DELTA):
+        coach_rating_groups, coach_keys, player_rating_groups, player_keys = self.validate_rating_groups(rating_groups)
+        weights = self.validate_weights(weights, player_rating_groups, player_keys)
+        group_size = len(coach_rating_groups)
+        if ranks is None:
+            ranks = range(group_size)
+        elif len(ranks) != group_size:
+            raise ValueError('Wrong ranks')
+        # sort rating groups by rank
+        by_rank = lambda x: x[1][2]
+        sorting = sorted(enumerate(zip(coach_rating_groups, player_rating_groups, ranks, weights)),
+                         key=by_rank)
+        sorted_coach_rating_groups, sorted_player_rating_groups, sorted_ranks, sorted_weights = [], [], [], []
+        for x, (crg, prg, r, w) in sorting:
+            sorted_coach_rating_groups.append(crg)
+            sorted_player_rating_groups.append(prg)
+            sorted_ranks.append(r)
+            # make weights to be greater than 0
+            sorted_weights.append(max(min_delta, w_) for w_ in w)
+        # build factor graph
+        args = (sorted_coach_rating_groups, sorted_player_rating_groups, sorted_ranks, sorted_weights)
+        builders = self.factor_graph_builders(*args)
+        args = builders + (min_delta,)
+        layers = self.run_schedule(*args)
+        # make result
+        coach_rating_layer, player_rating_layer, team_sizes = layers[0], layers[1], _team_sizes(sorted_player_rating_groups)
+        transformed_groups = []
+        coaches_groups = []
+        for start, end in zip([0] + team_sizes[:-1], team_sizes):
+            group = []
+            for f in player_rating_layer[start:end]:
+                group.append(Rating(float(f.var.mu), float(f.var.sigma)))
+            c = coach_rating_layer.pop(0)
+            coaches_groups.append(Rating(float(c.var.mu), float(c.var.sigma)))
+            transformed_groups.append(tuple(group))
+        by_hint = lambda x: x[0]
+        unsorting = sorted(zip((x for x, __ in sorting), coaches_groups, transformed_groups),
+                           key=by_hint)
+        if player_keys is None:
+            raise Exception("fix me")
+            return [g for x, g in unsorting]
+        # restore the structure with input dictionary keys
+        return [({coach_keys[x]: c}, dict(zip(player_keys[x], g))) for x, c, g in unsorting]
+
+
 def rate_1vs1(rating1, rating2, drawn=False, min_delta=DELTA, env=None):
     """A shortcut to rate just 2 players in a head-to-head match::
 
